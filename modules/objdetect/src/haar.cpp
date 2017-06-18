@@ -1290,12 +1290,12 @@ public:
         results.resize(range.end - range.start);
     }
 
-    std::vector<_Tp> *getVectorForThread(int offset)
+    std::vector<_Tp> *getVectorForThread( int offset )
     {
         return &results[offset - startingOffset];
     }
 
-    void appendResults(std::vector<_Tp> &combinedResults) const
+    void appendResults( std::vector<_Tp> &combinedResults ) const
     {
         size_t neededSize = combinedResults.size();
         for (size_t i = 0; i < results.size(); i++)
@@ -1762,7 +1762,7 @@ cvHaarDetectObjectsForROC( const CvArr* _img,
             cv::Range parallelForRange(startY, endY);
             cv::HaarParallelResultsStorage<cv::Rect> candidates(parallelForRange);
 
-            cv::parallel_for_(cv::Range(startY, endY),
+            cv::parallel_for_(parallelForRange,
                 cv::HaarDetectObjects_ScaleCascade_Invoker(cascade, winSize, cv::Range(startX, endX),
                                                            ystep, sum->step, (const int**)p,
                                                            (const int**)pq, candidates));
