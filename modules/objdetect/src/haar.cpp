@@ -1659,7 +1659,7 @@ cvHaarDetectObjectsForROC( const CvArr* _img,
             cv::HaarParallelResultsStorage<int> levels(parallelForRange);
             cv::HaarParallelResultsStorage<double> weights(parallelForRange);
 
-            cv::parallel_for_(cv::Range(0, stripCount),
+            cv::parallel_for_(parallelForRange,
                          cv::HaarDetectObjects_ScaleImage_Invoker(cascade,
                                 (((sz1.height + stripCount - 1)/stripCount + ystep-1)/ystep)*ystep,
                                 factor, cv::cvarrToMat(&sum1), cv::cvarrToMat(&sqsum1), &_norm1, &_mask1,
