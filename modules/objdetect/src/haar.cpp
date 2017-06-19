@@ -45,7 +45,6 @@
 #include "opencv2/imgproc/imgproc_c.h"
 #include "opencv2/objdetect/objdetect_c.h"
 #include <stdio.h>
-#include <map>
 
 #if CV_SSE2
 #   if 1 /*!CV_SSE4_1 && !CV_SSE4_2*/
@@ -1282,32 +1281,104 @@ cvRunHaarClassifierCascade( const CvHaarClassifierCascade* _cascade,
 namespace cv
 {
 
+template<typename _Tp> class ParallelAccessVectorProxy
+{
+public:
+    ParallelAccessVectorProxy()
+    {
+        vec = NULL;
+        mtx = NULL;
+    }
+
+    ParallelAccessVectorProxy( std::vector<_Tp> &_vec, cv::Mutex *_mtx = NULL )
+    {
+        vec = &_vec;
+        mtx = _mtx;
+    }
+
+    void push_back( const _Tp &value )
+    {
+        if (mtx){
+            mtx->lock();
+            vec->push_back(value);
+            mtx->unlock();
+        }
+        else
+            vec->push_back(value);
+    }
+
+    bool empty() const
+    {
+        return !vec;
+    }
+
+    std::vector<_Tp> *vec;
+    cv::Mutex *mtx;
+};
+
 template<typename _Tp> class HaarParallelResultsStorage
 {
 public:
-    std::vector<_Tp> *getVectorForThread( int offset )
+    HaarParallelResultsStorage( const cv::Range &_fullRange )
     {
-        mtx.lock();
-        std::vector<_Tp> *result = &results[offset];
-        mtx.unlock();
-        return result;
+        fullRange = _fullRange;
+        initialized = false;
+    }
+
+    ParallelAccessVectorProxy<_Tp> getVectorProxy( const cv::Range &subrange )
+    {
+        if (subrange.end == fullRange.end)
+        {
+            return ParallelAccessVectorProxy<_Tp>(lastSubrangeVec);
+        }
+        if (!initialized)
+        {
+            initialize(subrange);
+        }
+        int predictedIndex = (subrange.start - fullRange.start) / subrangeLength;
+        if (predictedIndex >= (int)results.size() || predictedIndex * subrangeLength != subrange.start - fullRange.start)
+        {
+            return ParallelAccessVectorProxy<_Tp>(vec, &mtx);
+        }
+        else
+        {
+            return ParallelAccessVectorProxy<_Tp>(results[predictedIndex]);
+        }
     }
 
     void appendResults( std::vector<_Tp> &combinedResults ) const
     {
-        size_t neededSize = combinedResults.size();
-        for (typename std::map<int, std::vector<_Tp> >::const_iterator iter = results.begin(); iter != results.end(); iter++)
+        size_t neededSize = combinedResults.size() + lastSubrangeVec.size() + vec.size();
+        for (size_t i = 0; i < results.size(); i++)
         {
-            neededSize += iter->second.size();
+            neededSize += results[i].size();
         }
         combinedResults.reserve(neededSize);
-        for (typename std::map<int, std::vector<_Tp> >::const_iterator iter = results.begin(); iter != results.end(); iter++)
+        for (size_t i = 0; i < results.size(); i++)
         {
-            combinedResults.insert(combinedResults.end(), iter->second.begin(), iter->second.end());
+            combinedResults.insert(combinedResults.end(), results[i].begin(), results[i].end());
         }
+        combinedResults.insert(combinedResults.end(), lastSubrangeVec.begin(), lastSubrangeVec.end());
+        combinedResults.insert(combinedResults.end(), vec.begin(), vec.end());
     }
 
-    std::map<int, std::vector<_Tp> > results;
+    void initialize( const cv::Range &subrange )
+    {
+        mtx.lock();
+        if (!initialized)
+        {
+            subrangeLength = subrange.size();
+            results.resize(fullRange.size() / subrangeLength);
+            initialized = true;
+        }
+        mtx.unlock();
+    }
+
+    bool initialized;
+    int subrangeLength;
+    cv::Range fullRange;
+    std::vector<std::vector<_Tp> > results;
+    std::vector<_Tp> lastSubrangeVec, vec;
     cv::Mutex mtx;
 };
 
@@ -1348,9 +1419,9 @@ public:
         Size ssz(sum1.cols - 1 - winSize0.width, y2 - y1);
         int x, y, ystep = factor > 2 ? 1 : 2;
 
-        std::vector<Rect> *vecForThread = vec->getVectorForThread(range.start);
-        std::vector<int> *rejectLevelsForThread = rejectLevels ? rejectLevels->getVectorForThread(range.start) : NULL;
-        std::vector<double> *levelWeightsForThread = levelWeights ? levelWeights->getVectorForThread(range.start) : NULL;
+        ParallelAccessVectorProxy<Rect> vecProxy;
+        ParallelAccessVectorProxy<int> rejectLevelsProxy;
+        ParallelAccessVectorProxy<double> levelWeightsProxy;
 
 #ifdef HAVE_IPP
         if(CV_IPP_CHECK_COND && cascade->hid_cascade->ipp_stages )
@@ -1398,8 +1469,12 @@ public:
                     for( x = 0; x < ssz.width; x += ystep )
                         if( mask1row[x] != 0 )
                         {
-                            vecForThread->push_back(Rect(cvRound(x*factor), cvRound(y*factor),
-                                                    winSize.width, winSize.height));
+                            if (vecProxy.empty())
+                            {
+                                vecProxy = vec->getVectorProxy(range);
+                            }
+                            vecProxy.push_back(Rect(cvRound(x*factor), cvRound(y*factor),
+                                               winSize.width, winSize.height));
                             if( --positive == 0 )
                                 break;
                         }
@@ -1420,18 +1495,28 @@ public:
                             result = -1*cascade->count;
                         if( cascade->count + result < 4 )
                         {
-                            vecForThread->push_back(Rect(cvRound(x*factor), cvRound(y*factor),
-                                                    winSize.width, winSize.height));
-                            rejectLevelsForThread->push_back(-result);
-                            levelWeightsForThread->push_back(gypWeight);
+                            if (vecProxy.empty())
+                            {
+                                vecProxy = vec->getVectorProxy(range);
+                                rejectLevelsProxy = rejectLevels->getVectorProxy(range);
+                                levelWeightsProxy = levelWeights->getVectorProxy(range);
+                            }
+                            vecProxy.push_back(Rect(cvRound(x*factor), cvRound(y*factor),
+                                               winSize.width, winSize.height));
+                            rejectLevelsProxy.push_back(-result);
+                            levelWeightsProxy.push_back(gypWeight);
                         }
                     }
                     else
                     {
                         if( result > 0 )
                         {
-                            vecForThread->push_back(Rect(cvRound(x*factor), cvRound(y*factor),
-                                                    winSize.width, winSize.height));
+                            if (vecProxy.empty())
+                            {
+                                vecProxy = vec->getVectorProxy(range);
+                            }
+                            vecProxy.push_back(Rect(cvRound(x*factor), cvRound(y*factor),
+                                               winSize.width, winSize.height));
                         }
                     }
                 }
@@ -1475,7 +1560,7 @@ public:
         bool doCannyPruning = p0 != 0;
         int sstep = (int)(sumstep/sizeof(p0[0]));
 
-        std::vector<Rect> *vecForThread = vec->getVectorForThread(range.start);
+        ParallelAccessVectorProxy<Rect> vecProxy;
 
         for( iy = startY; iy < endY; iy++ )
         {
@@ -1499,7 +1584,11 @@ public:
                 int result = cvRunHaarClassifierCascade( cascade, cvPoint(x, y), 0 );
                 if( result > 0 )
                 {
-                    vecForThread->push_back(Rect(x, y, winsize.width, winsize.height));
+                    if (vecProxy.empty())
+                    {
+                        vecProxy = vec->getVectorProxy(range);
+                    }
+                    vecProxy.push_back(Rect(x, y, winsize.width, winsize.height));
                 }
                 ixstep = result != 0 ? 1 : 2;
             }
@@ -1653,9 +1742,9 @@ cvHaarDetectObjectsForROC( const CvArr* _img,
 
             cv::Range parallelForRange(0, stripCount);
             cv::Mat _norm1 = cv::cvarrToMat(&norm1), _mask1 = cv::cvarrToMat(&mask1);
-            cv::HaarParallelResultsStorage<cv::Rect> candidates;
-            cv::HaarParallelResultsStorage<int> levels;
-            cv::HaarParallelResultsStorage<double> weights;
+            cv::HaarParallelResultsStorage<cv::Rect> candidates(parallelForRange);
+            cv::HaarParallelResultsStorage<int> levels(parallelForRange);
+            cv::HaarParallelResultsStorage<double> weights(parallelForRange);
 
             cv::parallel_for_(parallelForRange,
                          cv::HaarDetectObjects_ScaleImage_Invoker(cascade,
@@ -1758,7 +1847,7 @@ cvHaarDetectObjectsForROC( const CvArr* _img,
             }
 
             cv::Range parallelForRange(startY, endY);
-            cv::HaarParallelResultsStorage<cv::Rect> candidates;
+            cv::HaarParallelResultsStorage<cv::Rect> candidates(parallelForRange);
 
             cv::parallel_for_(parallelForRange,
                 cv::HaarDetectObjects_ScaleCascade_Invoker(cascade, winSize, cv::Range(startX, endX),
